@@ -17,7 +17,7 @@ cat > "$OUT/LICENSE.txt" <<EOT
 kairocopy $V for Windows (64-bit) - binary distribution
 Copyright (c) 2026 the kairocopy authors. All rights reserved.
 
-You may use this program. No source code of kairocopy is provided. It comes with no warranty of any kind.
+You may use this program. Its source code is at https://github.com/aisnote/kairocopy. It comes with no warranty of any kind.
 The third-party components inside it are listed in THIRD_PARTY_NOTICES.txt.
 EOT
 cat > "$OUT/THIRD_PARTY_NOTICES.txt" <<EOT
