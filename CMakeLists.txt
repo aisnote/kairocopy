@@ -29,3 +29,7 @@ target_compile_options(kairocopy-cli PRIVATE -Wall -Wextra -Wno-unused-parameter
 
 add_executable(kc_tests tests/tests.cpp)
 target_link_libraries(kc_tests PRIVATE kccore)
+
+add_executable(kairocopy WIN32 src/gui/app.cpp src/win/manifest.rc)
+target_link_libraries(kairocopy PRIVATE kccore comctl32 shlwapi shell32 ole32 uxtheme)
+target_compile_options(kairocopy PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)

@@ -49,6 +49,9 @@ struct Plan {
 
 struct AnalyzeProgress { int64_t files = 0, bytes = 0; std::string dir; };
 
+// Leaves out what is not important (rules.hpp): the plan as if analysed with important_only.
+void keep_important(Plan& p);
+
 // sources: files or folders (each lands in dest under its own name; a drive's root "C:\" as "C"); dest: a folder (made
 // when copying)
 Plan analyze(const std::vector<std::string>& sources, const std::string& dest, bool important_only, std::atomic<bool>* stop,

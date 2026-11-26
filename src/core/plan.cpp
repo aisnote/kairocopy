@@ -164,4 +164,21 @@ Plan analyze(const std::vector<std::string>& sources, const std::string& dest_in
     return p;
 }
 
+void keep_important(Plan& p) {
+    if (p.important_only) return;
+    p.important_only = true;
+    std::vector<Item> kept;
+    kept.reserve(p.items.size());
+    for (auto& it : p.items) {
+        if (important(it.cat)) { kept.push_back(std::move(it)); continue; }
+        (it.action == Action::Copy ? p.fresh : p.overwrite).files--;
+        (it.action == Action::Copy ? p.fresh : p.overwrite).bytes -= int64_t(it.size);
+        p.todo.files--; p.todo.bytes -= int64_t(it.size);
+    }
+    p.items = std::move(kept);
+    const Counts other = p.by_cat[int(Cat::Other)];
+    p.not_important.files += other.files; p.not_important.bytes += other.bytes;
+    p.todo_by_cat[int(Cat::Other)] = Counts{};
+}
+
 }  // namespace kc
