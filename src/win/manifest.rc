@@ -1,0 +1,3 @@
+// the programs' manifest: UTF-8 as the process code page (char strings are UTF-8), long paths, the common controls 6
+// (themed buttons, task dialogs), aware of the screen's DPI
+1 24 "kairocopy.manifest"
