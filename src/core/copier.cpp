@@ -76,7 +76,7 @@ bool hash_file(const std::string& path, std::string& hex, std::string& error) {
 struct Shared {
     const Plan& plan;
     const CopyOptions& opt;
-    std::atomic<int64_t> bytes{0}, files{0}, errors{0}, in_use{0};
+    std::atomic<int64_t> bytes{0}, files{0}, errors{0}, in_use{0}, times_set{0};
     std::atomic<bool> disk_full{false};
     std::mutex mu;
     std::vector<CopiedFile> done;                                // to record
@@ -111,6 +111,20 @@ void copy_one(Shared& sh, size_t slot, const Item& it) {
         std::lock_guard<std::mutex> l(sh.mu);
         if (sh.failed.size() < 100000) sh.failed.push_back({it.src, why});
     };
+    if (it.action == Action::FixTime) {
+        // the same content is there: the source's time on it, so that the next analysis sees it as the same at once
+        HANDLE h = CreateFileW(win::longw(it.dst).c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        FILETIME ft{DWORD(uint64_t(it.mtime) & 0xffffffff), DWORD(uint64_t(it.mtime) >> 32)};
+        const bool ok = h != INVALID_HANDLE_VALUE && SetFileTime(h, nullptr, nullptr, &ft);
+        const DWORD e = GetLastError();
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (!ok) { fail("cannot set its time: " + win::error_text(e)); return; }
+        sh.times_set++;
+        std::lock_guard<std::mutex> l(sh.mu);
+        sh.done.push_back(CopiedFile{it.dst, it.src, it.size, it.mtime, ""});
+        return;
+    }
     if (!sh.dirs.make(win::parent_of(it.dst))) { fail("cannot make the folder " + win::parent_of(it.dst) + ": " + win::error_text(GetLastError())); return; }
     const std::wstring src = win::longw(it.src), dst = win::longw(it.dst), tmp = dst + kPartSuffix;
     sh.now[slot].at = 0;
@@ -163,7 +177,10 @@ CopyReport copy(const Plan& plan, const CopyOptions& opt, const std::function<vo
     rep.manifest = manifest.path();
     std::string srcs;
     for (auto& s : plan.sources) srcs += (srcs.empty() ? "" : "|") + s;
-    const int64_t run = manifest.begin_run(srcs, plan.dest, plan.todo.files, plan.todo.bytes);
+    const int64_t run = manifest.begin_run(srcs, plan.dest, opt.options, plan.todo.files, plan.todo.bytes);
+    // half-copied files of an earlier run: each is either written again below or no longer wanted
+    for (auto& part : plan.stale_parts)
+        if (DeleteFileW(win::longw(part).c_str())) rep.parts_removed++;
 
     // two queues, both in the order of the target's paths
     std::vector<const Item*> big, small;
@@ -233,6 +250,7 @@ CopyReport copy(const Plan& plan, const CopyOptions& opt, const std::function<vo
         if (progress) progress(pr);
     }
     for (auto& th : pool) th.join();
+    rep.times_set = sh.times_set;
     rep.files = sh.files; rep.bytes = sh.bytes; rep.errors = sh.errors; rep.in_use = sh.in_use;
     rep.failed = std::move(sh.failed);
     rep.disk_full = sh.disk_full;

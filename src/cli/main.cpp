@@ -29,11 +29,14 @@ bool g_json = false;
 std::atomic<bool> g_stop{false};
 
 const char* kUsage =
-    "kairocopy-cli analyze <source>... --to <folder> [--important] [--json]\n"
-    "kairocopy-cli copy <source>... --to <folder> [--important] [--verify] [--writers BIG,SMALL] [--quiet] [--json]\n"
+    "kairocopy-cli analyze <source>... --to <folder> [--important] [--strict] [--json]\n"
+    "kairocopy-cli copy <source>... --to <folder> [--important] [--strict] [--conflict skip|overwrite|keep-both] [--verify]\n"
+    "                   [--writers BIG,SMALL] [--quiet] [--json]\n"
     "kairocopy-cli status <folder> [--json]\n"
     "  <source>: files or folders; each lands in <folder> under its own name (a drive's root C:\\ as C)\n"
     "  --important: only photos, videos, music, documents, mail, chats, code, designs and archives\n"
+    "  --strict: files already at the target are compared whole (else large ones in samples)\n"
+    "  --conflict: what becomes of target files that differ: left alone (default), replaced, or both kept\n"
     "  --verify: read both copies back and compare them\n";
 
 struct Args {
@@ -76,8 +79,10 @@ Value plan_json(const Plan& p) {
     v.set("to", p.dest);
     v.set("important_only", p.important_only);
     v.set("all", counts(p.all)); v.set("to_copy", counts(p.todo)); v.set("new", counts(p.fresh)); v.set("overwrite", counts(p.overwrite));
-    v.set("already_there", counts(p.same)); v.set("target_newer", counts(p.target_newer)); v.set("not_important", counts(p.not_important));
-    v.set("online_only", counts(p.online_only)); v.set("skipped_folders", p.skipped_dirs);
+    v.set("already_there", counts(p.same)); v.set("same_content", counts(p.same_content)); v.set("same_content_sampled", counts(p.same_sampled));
+    v.set("incomplete", counts(p.incomplete)); v.set("conflict", counts(p.conflict)); v.set("target_only", counts(p.target_only));
+    v.set("checked", counts(p.checked)); v.set("stale_parts", int64_t(p.stale_parts.size())); v.set("strict", p.strict);
+    v.set("not_important", counts(p.not_important)); v.set("online_only", counts(p.online_only)); v.set("skipped_folders", p.skipped_dirs);
     Value cats = Value::object();
     for (int i = 0; i < kCats; i++)
         if (p.by_cat[i].files)
@@ -90,8 +95,8 @@ Value plan_json(const Plan& p) {
     for (auto& x : p.errors) e.push(Value::object({{"path", x.first}, {"error", x.second}}));
     v.set("unreadable_folders", e);
     Value n = Value::array();
-    for (auto& x : p.target_newer_samples) n.push(x);
-    v.set("target_newer_samples", n);
+    for (size_t i = 0; i < p.conflicts.size() && i < 50; i++) n.push(p.conflicts[i].dst);
+    v.set("conflict_samples", n);
     v.set("seconds", p.seconds);
     v.set("stopped", p.stopped);
     return v;
@@ -111,8 +116,16 @@ std::string plan_text(const Plan& p) {
     snprintf(b, sizeof b, "to copy: %lld files, %s (new %lld, newer than the target's %lld)\n", (long long)p.todo.files, gb(p.todo.bytes).c_str(),
              (long long)p.fresh.files, (long long)p.overwrite.files);
     t += b;
-    snprintf(b, sizeof b, "already at the target: %lld (%s); the target's is newer: %lld; not important: %lld; online only: %lld\n", (long long)p.same.files,
-             gb(p.same.bytes).c_str(), (long long)p.target_newer.files, (long long)p.not_important.files, (long long)p.online_only.files);
+    snprintf(b, sizeof b, "already at the target: %lld (%s), %lld more with the same content (another time); incomplete there: %lld; differ there: %lld\n",
+             (long long)p.same.files, gb(p.same.bytes).c_str(), (long long)p.same_content.files, (long long)p.incomplete.files, (long long)p.conflict.files);
+    t += b;
+    if (p.checked.files) {
+        snprintf(b, sizeof b, "  compared: %lld files (%s read%s)\n", (long long)p.checked.files, gb(p.checked.bytes).c_str(), p.strict ? ", whole" : "");
+        t += b;
+    }
+    for (size_t i = 0; i < p.conflicts.size() && i < 5; i++) t += "  differs at the target: " + p.conflicts[i].dst + "\n";
+    snprintf(b, sizeof b, "only at the target: %lld; not important: %lld; online only: %lld\n", (long long)p.target_only.files, (long long)p.not_important.files,
+             (long long)p.online_only.files);
     t += b;
     snprintf(b, sizeof b, "target %s: %s free, %s\n", p.dest.c_str(), gb(int64_t(p.free_bytes)).c_str(), p.target_seeks ? "a hard disk" : "an SSD");
     t += b;
@@ -125,13 +138,19 @@ Plan plan_from(const Args& a, bool quiet) {
     if (!a.has("to")) throw Usage("where to? --to <folder>");
     for (auto& s : a.pos)
         if (GetFileAttributesW(win::longw(win::absolute(s)).c_str()) == INVALID_FILE_ATTRIBUTES) throw std::runtime_error("cannot find " + s);
-    return analyze(a.pos, a.opt.at("to"), a.has("important"), &g_stop, [&](const AnalyzeProgress& p) {
-        if (!quiet) std::fprintf(stderr, "\ranalysing: %lld files, %s   ", (long long)p.files, gb(p.bytes).c_str());
+    AnalyzeOptions o;
+    o.important_only = a.has("important");
+    o.strict = a.has("strict");
+    o.stop = &g_stop;
+    return analyze(a.pos, a.opt.at("to"), o, [&](const AnalyzeProgress& p) {
+        if (quiet) return;
+        if (p.checking) std::fprintf(stderr, "\rcomparing with the target: %lld / %lld files   ", (long long)p.check_done, (long long)p.check_total);
+        else std::fprintf(stderr, "\ranalysing: %lld files, %s   ", (long long)p.files, gb(p.bytes).c_str());
     });
 }
 
 int cmd_analyze(int argc, char** argv) {
-    Args a = parse(argc, argv, {"to"}, {"important", "quiet"});
+    Args a = parse(argc, argv, {"to"}, {"important", "strict", "quiet"});
     Plan p = plan_from(a, a.has("quiet"));
     if (!a.has("quiet")) std::fprintf(stderr, "\n");
     emit(plan_json(p), plan_text(p));
@@ -139,9 +158,12 @@ int cmd_analyze(int argc, char** argv) {
 }
 
 int cmd_copy(int argc, char** argv) {
-    Args a = parse(argc, argv, {"to", "writers"}, {"important", "verify", "quiet"});
+    Args a = parse(argc, argv, {"to", "writers", "conflict"}, {"important", "strict", "verify", "quiet"});
     const bool quiet = a.has("quiet");
+    const std::string conflict = a.has("conflict") ? a.opt.at("conflict") : "skip";
+    if (conflict != "skip" && conflict != "overwrite" && conflict != "keep-both") throw Usage("--conflict skip|overwrite|keep-both");
     Plan p = plan_from(a, quiet);
+    resolve_conflicts(p, conflict == "overwrite" ? ConflictPolicy::Overwrite : conflict == "keep-both" ? ConflictPolicy::KeepBoth : ConflictPolicy::Skip);
     if (!quiet) std::fprintf(stderr, "\n%s", plan_text(p).c_str());
     if (p.stopped) throw std::runtime_error("stopped while analysing");
     // the room it needs: what is new, and what grows where an older copy is replaced
@@ -150,6 +172,8 @@ int cmd_copy(int argc, char** argv) {
     CopyOptions o;
     o.verify = a.has("verify");
     o.stop = &g_stop;
+    o.options = std::string(a.has("important") ? "important " : "") + (a.has("verify") ? "verify " : "") + (a.has("strict") ? "strict " : "") +
+                "conflict=" + conflict;
     if (a.has("writers")) {
         const std::string w = a.opt.at("writers");
         const size_t c = w.find(',');
@@ -168,6 +192,7 @@ int cmd_copy(int argc, char** argv) {
     v.set("ok", !r.stopped && r.errors == 0);
     v.set("copied", Value::object({{"files", r.files}, {"bytes", r.bytes}}));
     v.set("errors", r.errors); v.set("in_use", r.in_use); v.set("stopped", r.stopped); v.set("disk_full", r.disk_full);
+    v.set("times_set", r.times_set); v.set("parts_removed", r.parts_removed);
     v.set("copy_seconds", r.seconds);
     v.set("mb_per_second", r.seconds > 0 ? r.bytes / r.seconds / 1e6 : 0.0);
     v.set("manifest", r.manifest);
@@ -179,6 +204,8 @@ int cmd_copy(int argc, char** argv) {
              (long long)r.files, gb(r.bytes).c_str(), r.seconds, r.seconds > 0 ? r.bytes / r.seconds / 1e6 : 0.0, r.seconds > 0 ? r.files / r.seconds : 0.0,
              (long long)r.errors, (long long)r.in_use);
     std::string t = b;
+    if (r.times_set) t += "  " + std::to_string(r.times_set) + " files already there with the same content: given the source's time\n";
+    if (r.parts_removed) t += "  " + std::to_string(r.parts_removed) + " half-copied files of an earlier run removed\n";
     for (size_t i = 0; i < r.failed.size() && i < 10; i++) t += "  " + r.failed[i].first + ": " + r.failed[i].second + "\n";
     if (r.disk_full) t += "  the target is full\n";
     t += "record: " + r.manifest + "\n";
@@ -195,9 +222,17 @@ int cmd_status(int argc, char** argv) {
     const auto all = m.summary("");
     Value v = Value::object({{"folder", dir}, {"manifest", m.path()}, {"files", s.files}, {"bytes", s.bytes}, {"drive_files", all.files},
                              {"drive_bytes", all.bytes}, {"runs", all.runs}, {"last_run", all.last_run}});
-    emit(v, "copied by kairocopy under " + dir + ": " + std::to_string(s.files) + " files, " + gb(s.bytes) + "\non the whole drive: " +
-                std::to_string(all.files) + " files, " + gb(all.bytes) + ", " + std::to_string(all.runs) + " runs, the last " + all.last_run +
-                "\nrecord: " + m.path() + "\n");
+    std::string t = "copied by kairocopy under " + dir + ": " + std::to_string(s.files) + " files, " + gb(s.bytes) + "\non the whole drive: " +
+                    std::to_string(all.files) + " files, " + gb(all.bytes) + ", " + std::to_string(all.runs) + " runs, the last " + all.last_run +
+                    "\nrecord: " + m.path() + "\n";
+    Manifest::Run run;
+    if (Manifest::unfinished(m.path(), run)) {
+        v.set("unfinished", Value::object({{"run", run.id}, {"sources", run.sources}, {"to", run.dest}, {"options", run.options},
+                                           {"planned_files", run.planned_files}, {"copied_files", run.files}}));
+        t += "unfinished: " + run.sources + " -> " + run.dest + " (" + std::to_string(run.files) + " of " + std::to_string(run.planned_files) +
+             " files); run the same copy again to go on\n";
+    }
+    emit(v, t);
     return 0;
 }
 

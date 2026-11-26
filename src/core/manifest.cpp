@@ -6,6 +6,7 @@
 #include "core/manifest.hpp"
 #include "core/rules.hpp"
 #include "win/sys.hpp"
+#include <cstdlib>
 
 namespace kc {
 
@@ -23,7 +24,9 @@ static bool make_hidden_dir(const std::string& dir) {
 }
 
 Manifest::Manifest(const std::string& dest) {
-    std::string dir = win::join(win::volume_root(dest), kStateDir);
+    // KAIROCOPY_STATE: another place for the record (the tests: not the root of the drive they run on)
+    const char* over = std::getenv("KAIROCOPY_STATE");
+    std::string dir = win::join(over && *over ? std::string(over) : win::volume_root(dest), kStateDir);
     if (!make_hidden_dir(dir)) {
         dir = win::join(dest, kStateDir);
         if (!make_hidden_dir(dir)) throw DbError("cannot make " + dir);
@@ -31,6 +34,40 @@ Manifest::Manifest(const std::string& dest) {
     path_ = win::join(dir, "manifest.db");
     db_ = std::make_unique<Db>(path_);
     db_->exec(kSchema);
+    // added after the first version
+    bool has_options = false;
+    {
+        auto s = db_->prepare("PRAGMA table_info(runs)");
+        while (s.step()) if (s.text(1) == "options") has_options = true;
+    }
+    if (!has_options) db_->exec("ALTER TABLE runs ADD COLUMN options TEXT; ALTER TABLE runs ADD COLUMN set_aside INTEGER DEFAULT 0;");
+}
+
+bool Manifest::unfinished(const std::string& path, Run& r) {
+    if (GetFileAttributesW(win::longw(path).c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    try {
+        Db db(path);
+        bool has_options = false;
+        {
+            auto s = db.prepare("PRAGMA table_info(runs)");
+            while (s.step()) if (s.text(1) == "options") has_options = true;
+        }
+        if (!has_options) return false;
+        auto s = db.prepare("SELECT id, started_ms, planned_files, planned_bytes, (SELECT COUNT(*) FROM copies c WHERE c.copied_ms>=r.started_ms), "
+                            "(SELECT COALESCE(SUM(size),0) FROM copies c WHERE c.copied_ms>=r.started_ms), sources, dest, COALESCE(options,'') FROM runs r "
+                            "WHERE (finished_ms IS NULL OR stopped=1) AND set_aside=0 AND NOT EXISTS (SELECT 1 FROM runs l WHERE l.id>r.id "
+                            "AND l.sources=r.sources AND l.dest=r.dest AND l.finished_ms IS NOT NULL AND l.stopped=0) ORDER BY id DESC LIMIT 1");
+        if (!s.step()) return false;
+        r = Run{s.i64(0), s.i64(1), s.i64(2), s.i64(3), s.i64(4), s.i64(5), s.text(6), s.text(7), s.text(8)};
+        return true;
+    } catch (const std::exception&) { return false; }
+}
+
+void Manifest::set_aside(const std::string& path, int64_t run) {
+    try {
+        Db db(path);
+        db.prepare("UPDATE runs SET set_aside=1 WHERE id=?").bind(1, run).run();
+    } catch (const std::exception&) {}
 }
 
 std::unordered_map<std::string, Manifest::Rec> Manifest::under(const std::string& dir) {
@@ -61,9 +98,9 @@ void Manifest::record(const std::vector<CopiedFile>& files) {
     t.commit();
 }
 
-int64_t Manifest::begin_run(const std::string& sources, const std::string& dest, int64_t files, int64_t bytes) {
-    db_->prepare("INSERT INTO runs(started_ms,sources,dest,planned_files,planned_bytes,files,bytes,errors,stopped) VALUES(?,?,?,?,?,0,0,0,0)")
-        .bind(1, win::now_ms()).bind(2, sources).bind(3, dest).bind(4, files).bind(5, bytes).run();
+int64_t Manifest::begin_run(const std::string& sources, const std::string& dest, const std::string& options, int64_t files, int64_t bytes) {
+    db_->prepare("INSERT INTO runs(started_ms,sources,dest,options,planned_files,planned_bytes,files,bytes,errors,stopped) VALUES(?,?,?,?,?,?,0,0,0,0)")
+        .bind(1, win::now_ms()).bind(2, sources).bind(3, dest).bind(4, options).bind(5, files).bind(6, bytes).run();
     return db_->last_id();
 }
 

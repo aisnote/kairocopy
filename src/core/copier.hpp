@@ -19,6 +19,7 @@ struct CopyOptions {
     bool verify = false;                      // read both back and compare (xxh3-128), stored in the manifest
     std::atomic<bool>* stop = nullptr;
     std::atomic<bool>* pause = nullptr;
+    std::string options;                      // recorded with the run ("important", "verify", ...), to go on with it later
 };
 
 struct CopyProgress {
@@ -31,6 +32,8 @@ struct CopyProgress {
 
 struct CopyReport {
     int64_t files = 0, bytes = 0, errors = 0, in_use = 0;
+    int64_t times_set = 0;                    // files already there (same content) given the source's time
+    int64_t parts_removed = 0;                // half-copied files of an earlier run removed
     double seconds = 0;
     bool stopped = false, disk_full = false;
     std::vector<std::pair<std::string, std::string>> failed;   // source, why

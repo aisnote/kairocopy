@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 #include "core/copier.hpp"
+#include "core/manifest.hpp"
 #include "core/plan.hpp"
 #include "win/sys.hpp"
 
@@ -31,7 +32,7 @@ enum : int {
     ID_LEFT_LIST = 100, ID_RIGHT_LIST, ID_LEFT_DRIVE, ID_RIGHT_DRIVE, ID_LEFT_UP, ID_RIGHT_UP, ID_LEFT_PATH, ID_RIGHT_PATH,
     ID_ANALYZE = 200, ID_COPY, ID_PAUSE, ID_STOP, ID_REFRESH, ID_TAB, ID_SELALL,
 };
-constexpr UINT WM_APP_ANALYZED = WM_APP + 1, WM_APP_COPIED = WM_APP + 2;
+constexpr UINT WM_APP_ANALYZED = WM_APP + 1, WM_APP_COPIED = WM_APP + 2, WM_APP_START = WM_APP + 3;
 constexpr UINT_PTR TIMER_PROGRESS = 1;
 
 std::wstring W(const std::string& s) { return win::widen(s); }
@@ -358,6 +359,44 @@ std::vector<std::string> selection(int side) {
     return out;
 }
 
+// what was chosen for the copy under way, kept with its run (to go on with it after a stop) and used as the defaults
+// when going on with an unfinished one
+struct Choices { bool important = false, verify = false, strict = false; ConflictPolicy conflict = ConflictPolicy::Skip; };
+Choices g_choices;
+std::vector<std::string> g_sources;
+std::string g_dest;
+
+std::string options_text(const Choices& c) {
+    return std::string(c.important ? "important " : "") + (c.verify ? "verify " : "") + (c.strict ? "strict " : "") + "conflict=" +
+           (c.conflict == ConflictPolicy::Overwrite ? "overwrite" : c.conflict == ConflictPolicy::KeepBoth ? "keep-both" : "skip");
+}
+Choices options_of(const std::string& s) {
+    Choices c;
+    c.important = s.find("important") != std::string::npos;
+    c.verify = s.find("verify") != std::string::npos;
+    c.strict = s.find("strict") != std::string::npos;
+    c.conflict = s.find("conflict=overwrite") != std::string::npos ? ConflictPolicy::Overwrite
+               : s.find("conflict=keep-both") != std::string::npos ? ConflictPolicy::KeepBoth : ConflictPolicy::Skip;
+    return c;
+}
+
+void run_analysis(const std::vector<std::string>& src, const std::string& dest, bool strict) {
+    g_sources = src;
+    g_dest = dest;
+    g.stop = false;
+    { std::lock_guard<std::mutex> l(g.mu); g.aprog = {}; }
+    set_busy(App::Busy::Analyzing);
+    if (g.worker.joinable()) g.worker.join();
+    g.worker = std::thread([src, dest, strict] {
+        AnalyzeOptions o;
+        o.strict = strict;
+        o.stop = &g.stop;
+        Plan p = analyze(src, dest, o, [](const AnalyzeProgress& a) { std::lock_guard<std::mutex> l(g.mu); g.aprog = a; });
+        { std::lock_guard<std::mutex> l(g.mu); g.plan = std::move(p); }
+        PostMessageW(g.wnd, WM_APP_ANALYZED, 0, 0);
+    });
+}
+
 void start_analysis(bool then_copy) {
     if (g.busy != App::Busy::No) return;
     const int from = g.active, to = 1 - from;
@@ -371,28 +410,36 @@ void start_analysis(bool then_copy) {
         }
     if (win::key_of(U(g.pane[from].dir)) == win::key_of(dest)) { MessageBoxW(g.wnd, L"两边是同一个文件夹。", L"kairocopy", MB_ICONWARNING); return; }
     g.copy_after_analysis = then_copy;
-    g.stop = false;
-    { std::lock_guard<std::mutex> l(g.mu); g.aprog = {}; }
-    set_busy(App::Busy::Analyzing);
-    if (g.worker.joinable()) g.worker.join();
-    g.worker = std::thread([src, dest] {
-        Plan p = analyze(src, dest, false, &g.stop, [](const AnalyzeProgress& a) { std::lock_guard<std::mutex> l(g.mu); g.aprog = a; });
-        { std::lock_guard<std::mutex> l(g.mu); g.plan = std::move(p); }
-        PostMessageW(g.wnd, WM_APP_ANALYZED, 0, 0);
-    });
+    g_choices = Choices{};
+    run_analysis(src, dest, false);
 }
 
-std::wstring plan_summary(const Plan& p, bool important_only) {
-    Counts todo = p.todo;
-    if (important_only) { todo.files -= p.todo_by_cat[int(Cat::Other)].files; todo.bytes -= p.todo_by_cat[int(Cat::Other)].bytes; }
+std::wstring plan_summary(const Plan& p) {
     std::wstring t = L"共 " + num(p.all.files) + L" 个文件，" + size_text(uint64_t(p.all.bytes)) + L"\n";
-    t += L"要拷贝：" + num(todo.files) + L" 个，" + size_text(uint64_t(todo.bytes)) + L"\n";
-    t += L"已经拷过（相同，跳过）：" + num(p.same.files) + L" 个，" + size_text(uint64_t(p.same.bytes)) + L"\n";
-    if (p.overwrite.files) t += L"源文件更新，覆盖目标里的旧版本：" + num(p.overwrite.files) + L" 个\n";
-    if (p.target_newer.files) t += L"目标里的更新或不同，不动：" + num(p.target_newer.files) + L" 个\n";
+    t += L"要拷贝：" + num(p.todo.files) + L" 个，" + size_text(uint64_t(p.todo.bytes));
+    if (p.overwrite.files || p.incomplete.files) {
+        t += L"（新的 " + num(p.fresh.files);
+        if (p.overwrite.files) t += L"，源文件更新的 " + num(p.overwrite.files);
+        if (p.incomplete.files) t += L"，目标里没拷完的 " + num(p.incomplete.files);
+        t += L"）";
+    }
+    t += L"\n";
+    t += L"已在目标里、完全相同：" + num(p.same.files) + L" 个，" + size_text(uint64_t(p.same.bytes)) + L"\n";
+    if (p.same_content.files) {
+        t += L"已在目标里、内容相同但时间不同：" + num(p.same_content.files) + L" 个（不拷";
+        if (p.same_content.files > p.same_sampled.files) t += L"，把目标的时间改成和源一致";
+        if (p.same_sampled.files) t += L"；其中 " + num(p.same_sampled.files) + L" 个大文件是抽查的，时间不改";
+        t += L"）\n";
+    }
+    if (p.conflict.files) t += L"目标里的不一样（冲突）：" + num(p.conflict.files) + L" 个，开始拷贝后选择怎么处理\n";
+    if (p.target_only.files) t += L"只在目标里有：" + num(p.target_only.files) + L" 个（不动）\n";
+    if (p.checked.files)
+        t += L"核对了 " + num(p.checked.files) + L" 个文件的内容（读了 " + size_text(uint64_t(p.checked.bytes)) + L"" +
+             (p.sampled.files ? L"，其中 " + num(p.sampled.files) + L" 个大文件是抽查" : std::wstring(p.strict ? L"，完整核对" : L"")) + L"）\n";
+    if (!p.stale_parts.empty()) t += L"上次没拷完留下的 .kcpart 半成品：" + num(int64_t(p.stale_parts.size())) + L" 个（拷贝时清理）\n";
     if (p.online_only.files) t += L"只在云端（OneDrive 等），不下载：" + num(p.online_only.files) + L" 个\n";
     if (p.skipped_dirs) t += L"跳过的系统、程序、缓存文件夹：" + num(p.skipped_dirs) + L" 个\n";
-    if (!p.errors.empty()) t += L"读不了的文件夹：" + num(int64_t(p.errors.size())) + L" 个\n";
+    if (!p.errors.empty()) t += L"读不了或核对不了的：" + num(int64_t(p.errors.size())) + L" 个\n";
     t += L"目标剩余空间：" + size_text(p.free_bytes) + (p.target_seeks ? L"（机械硬盘）" : L"（固态）");
     return t;
 }
@@ -403,13 +450,13 @@ std::wstring category_table(const Plan& p) {
         t += std::wstring(W(cat_label(Cat(i)))) + L"：" + num(p.by_cat[i].files) + L" 个 " + size_text(uint64_t(p.by_cat[i].bytes)) + L"  /  " +
              num(p.todo_by_cat[i].files) + L" 个 " + size_text(uint64_t(p.todo_by_cat[i].bytes)) + L"\n";
     }
+    for (size_t i = 0; i < p.conflicts.size() && i < 10; i++) t += L"冲突：" + W(p.conflicts[i].dst) + L"\n";
     for (size_t i = 0; i < p.errors.size() && i < 10; i++) t += L"读不了：" + W(p.errors[i].first) + L"（" + W(p.errors[i].second) + L"）\n";
     return t;
 }
 
-void start_copy(bool important_only, bool verify) {
-    if (important_only) keep_important(g.plan);
-    if (uint64_t(g.plan.fresh.bytes) > g.plan.free_bytes + uint64_t(g.plan.overwrite.bytes)) {
+void start_copy() {
+    if (uint64_t(g.plan.fresh.bytes) > g.plan.free_bytes + uint64_t(g.plan.overwrite.bytes + g.plan.incomplete.bytes)) {
         MessageBoxW(g.wnd, (L"目标空间不够：要拷 " + size_text(uint64_t(g.plan.todo.bytes)) + L"，只剩 " + size_text(g.plan.free_bytes)).c_str(), L"kairocopy",
                     MB_ICONERROR);
         return;
@@ -419,9 +466,10 @@ void start_copy(bool important_only, bool verify) {
     { std::lock_guard<std::mutex> l(g.mu); g.cprog = {}; g.cprog.files_total = g.plan.todo.files; g.cprog.bytes_total = g.plan.todo.bytes; }
     set_busy(App::Busy::Copying);
     if (g.worker.joinable()) g.worker.join();
-    g.worker = std::thread([verify] {
+    g.worker = std::thread([] {
         CopyOptions o;
-        o.verify = verify;
+        o.verify = g_choices.verify;
+        o.options = options_text(g_choices);
         o.stop = &g.stop;
         o.pause = &g.pause;
         CopyReport r;
@@ -436,6 +484,39 @@ void start_copy(bool important_only, bool verify) {
     });
 }
 
+// the target files that differ: left alone (recommended), replaced, or both kept. false: cancelled.
+bool ask_conflicts() {
+    Plan& p = g.plan;
+    if (p.conflicts.empty()) return true;
+    std::wstring list;
+    for (size_t i = 0; i < p.conflicts.size() && i < 30; i++) list += W(p.conflicts[i].dst) + L"\n";
+    if (p.conflicts.size() > 30) list += L"……共 " + num(int64_t(p.conflicts.size())) + L" 个";
+    const std::wstring head = L"目标里有 " + num(int64_t(p.conflicts.size())) + L" 个同名文件和源文件不一样";
+    TASKDIALOG_BUTTON btns[] = {{201, L"不动目标里的（推荐）\n保留目标里的版本，拷完后列在清单里"},
+                                {202, L"用源文件覆盖\n目标里的版本会被替换"},
+                                {203, L"两个都保留\n源文件另存为“名字（来自源）.扩展名”"}};
+    TASKDIALOGCONFIG c{};
+    c.cbSize = sizeof c;
+    c.hwndParent = g.wnd;
+    c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_COMMAND_LINKS | TDF_EXPAND_FOOTER_AREA;
+    c.pszWindowTitle = L"kairocopy";
+    c.pszMainInstruction = head.c_str();
+    c.pszContent = L"可能是别的软件拷过来之后又被改过，或者本来就是另一个文件。";
+    c.pszExpandedInformation = list.c_str();
+    c.pszCollapsedControlText = L"看是哪些";
+    c.pszExpandedControlText = L"看是哪些";
+    c.pButtons = btns;
+    c.cButtons = 3;
+    c.nDefaultButton = g_choices.conflict == ConflictPolicy::Overwrite ? 202 : g_choices.conflict == ConflictPolicy::KeepBoth ? 203 : 201;
+    c.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    c.pszMainIcon = TD_WARNING_ICON;
+    int button = 0;
+    if (FAILED(TaskDialogIndirect(&c, &button, nullptr, nullptr)) || button == IDCANCEL) return false;
+    g_choices.conflict = button == 202 ? ConflictPolicy::Overwrite : button == 203 ? ConflictPolicy::KeepBoth : ConflictPolicy::Skip;
+    resolve_conflicts(p, g_choices.conflict);
+    return true;
+}
+
 void on_analyzed() {
     if (g.worker.joinable()) g.worker.join();
     set_busy(App::Busy::No);
@@ -445,8 +526,8 @@ void on_analyzed() {
                                   size_text(uint64_t(p.todo.bytes)) + L"），用时 " + std::to_wstring(int(p.seconds + 0.5)) + L" 秒").c_str());
     if (p.stopped) { SetWindowTextW(g.total_text, L"分析已停止"); return; }
     const std::wstring dest = W(p.dest);
-    if (p.todo.files == 0) {
-        TaskDialog(g.wnd, nullptr, L"kairocopy", L"没有要拷贝的：都已经在目标里了", plan_summary(p, false).c_str(), TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr);
+    if (p.items.empty() && p.conflicts.empty()) {
+        TaskDialog(g.wnd, nullptr, L"kairocopy", L"没有要拷贝的：都已经在目标里了", plan_summary(p).c_str(), TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr);
         return;
     }
     Counts imp = p.todo;
@@ -455,12 +536,15 @@ void on_analyzed() {
     const std::wstring all_label = L"全部拷贝（" + num(p.todo.files) + L" 个，" + size_text(uint64_t(p.todo.bytes)) + L"）";
     const std::wstring imp_label = L"只拷重要的：照片、视频、音乐、文档、邮件、聊天记录、代码、设计稿、压缩包（" + num(imp.files) + L" 个，" + size_text(uint64_t(imp.bytes)) + L"）";
     TASKDIALOG_BUTTON radios[] = {{1, all_label.c_str()}, {2, imp_label.c_str()}};
-    TASKDIALOG_BUTTON btns[] = {{IDOK, L"开始拷贝"}, {IDCANCEL, L"取消"}};
-    const std::wstring title = L"拷贝到 " + dest, content = plan_summary(p, false), more = category_table(p);
+    std::vector<TASKDIALOG_BUTTON> btns = {{IDOK, L"开始拷贝"}};
+    // the large files compared in samples: a whole comparison on demand
+    if (p.sampled.files && !p.strict) btns.push_back({100, L"完整核对"});
+    btns.push_back({IDCANCEL, L"取消"});
+    const std::wstring title = L"拷贝到 " + dest, content = plan_summary(p), more = category_table(p);
     TASKDIALOGCONFIG c{};
     c.cbSize = sizeof c;
     c.hwndParent = g.wnd;
-    c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_EXPAND_FOOTER_AREA | TDF_SIZE_TO_CONTENT;
+    c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_EXPAND_FOOTER_AREA | TDF_SIZE_TO_CONTENT | (g_choices.verify ? TDF_VERIFICATION_FLAG_CHECKED : 0);
     c.pszWindowTitle = L"kairocopy";
     c.pszMainInstruction = title.c_str();
     c.pszContent = content.c_str();
@@ -469,16 +553,85 @@ void on_analyzed() {
     c.pszExpandedControlText = L"按类别看";
     c.pRadioButtons = radios;
     c.cRadioButtons = 2;
-    c.nDefaultRadioButton = 1;
-    c.pButtons = btns;
-    c.cButtons = 2;
+    c.nDefaultRadioButton = g_choices.important ? 2 : 1;
+    c.pButtons = btns.data();
+    c.cButtons = UINT(btns.size());
     c.nDefaultButton = IDOK;
     c.pszVerificationText = L"拷完后逐个读回来校验（更慢，更放心）";
     c.pszMainIcon = TD_INFORMATION_ICON;
     int button = 0, radio = 0;
     BOOL verify = FALSE;
-    if (FAILED(TaskDialogIndirect(&c, &button, &radio, &verify)) || button != IDOK) return;
-    start_copy(radio == 2, verify != FALSE);
+    if (FAILED(TaskDialogIndirect(&c, &button, &radio, &verify)) || button == IDCANCEL) return;
+    g_choices.important = radio == 2;
+    g_choices.verify = verify != FALSE;
+    if (button == 100) { g_choices.strict = true; run_analysis(g_sources, g_dest, true); return; }
+    if (g_choices.important) keep_important(g.plan);
+    if (!ask_conflicts()) return;
+    if (g.plan.items.empty()) { TaskDialog(g.wnd, nullptr, L"kairocopy", L"没有要拷贝的", nullptr, TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr); return; }
+    start_copy();
+}
+
+// The last copy to a drive that did not finish: offered when the program starts, if its sources are still there.
+void offer_unfinished() {
+    struct Found { std::string manifest; Manifest::Run run; };
+    std::vector<Found> found;
+    const DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        if (!(mask & (1u << i))) continue;
+        const std::wstring root = std::wstring(1, wchar_t(L'A' + i)) + L":\\";
+        const UINT t = GetDriveTypeW(root.c_str());
+        if (t != DRIVE_FIXED && t != DRIVE_REMOVABLE) continue;
+        const std::string path = U(root) + kStateDir + "\\manifest.db";
+        Manifest::Run run;
+        if (!Manifest::unfinished(path, run)) continue;
+        bool there = win::is_dir(run.dest) || win::is_dir(win::parent_of(run.dest));
+        size_t from = 0;
+        while (there && from <= run.sources.size()) {
+            const size_t bar = run.sources.find('|', from);
+            const std::string s = run.sources.substr(from, bar == std::string::npos ? std::string::npos : bar - from);
+            if (GetFileAttributesW(win::longw(s).c_str()) == INVALID_FILE_ATTRIBUTES) there = false;
+            if (bar == std::string::npos) break;
+            from = bar + 1;
+        }
+        if (there) found.push_back({path, run});
+    }
+    if (found.empty()) return;
+    const Found& f = *std::max_element(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.run.started_ms < b.run.started_ms; });
+    std::vector<std::string> sources;
+    for (size_t from = 0;;) {
+        const size_t bar = f.run.sources.find('|', from);
+        sources.push_back(f.run.sources.substr(from, bar == std::string::npos ? std::string::npos : bar - from));
+        if (bar == std::string::npos) break;
+        from = bar + 1;
+    }
+    std::wstring src_text;
+    for (auto& s : sources) src_text += L"  " + W(s) + L"\n";
+    const std::wstring content = L"从：\n" + src_text + L"到：\n  " + W(f.run.dest) + L"\n\n开始于 " + W(win::time_text((f.run.started_ms + 11644473600000LL) * 10000)) +
+                                 L"，当时已拷 " + num(f.run.files) + L" / " + num(f.run.planned_files) + L" 个文件。\n继续的话会重新分析，只拷还没拷完的。";
+    TASKDIALOG_BUTTON btns[] = {{IDOK, L"继续拷贝"}, {IDCANCEL, L"以后再说"}, {300, L"不再提示"}};
+    TASKDIALOGCONFIG c{};
+    c.cbSize = sizeof c;
+    c.hwndParent = g.wnd;
+    c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    c.pszWindowTitle = L"kairocopy";
+    c.pszMainInstruction = L"上次的拷贝没有完成";
+    c.pszContent = content.c_str();
+    c.pButtons = btns;
+    c.cButtons = 3;
+    c.nDefaultButton = IDOK;
+    c.pszMainIcon = TD_INFORMATION_ICON;
+    int button = 0;
+    if (FAILED(TaskDialogIndirect(&c, &button, nullptr, nullptr))) return;
+    if (button == 300) { Manifest::set_aside(f.manifest, f.run.id); return; }
+    if (button != IDOK) return;
+    // the panes where the copy was: the sources' folder on the left, the target on the right
+    const std::string left = win::is_dir(sources[0]) && sources.size() == 1 ? win::parent_of(sources[0]) : win::parent_of(sources[0]);
+    if (!left.empty() && win::is_dir(left)) load(0, W(left), W(win::name_of(sources[0])));
+    if (win::is_dir(f.run.dest)) load(1, W(f.run.dest));
+    activate(0);
+    g_choices = options_of(f.run.options);
+    g.copy_after_analysis = true;
+    run_analysis(sources, f.run.dest, g_choices.strict);
 }
 
 void on_copied() {
@@ -492,7 +645,13 @@ void on_copied() {
     swprintf(b, 300, L"拷贝了 %ls 个文件，%ls，用时 %d 分 %d 秒（平均 %.0f MB/s）\n没拷成：%ls 个（其中被别的程序占用 %ls 个）", num(r.files).c_str(),
              size_text(uint64_t(r.bytes)).c_str(), int(r.seconds) / 60, int(r.seconds) % 60, r.seconds > 0 ? r.bytes / r.seconds / 1e6 : 0.0,
              num(r.errors).c_str(), num(r.in_use).c_str());
+    std::wstring extra;
+    if (r.times_set) extra += L"\n已在目标里、内容相同的 " + num(r.times_set) + L" 个：时间改成和源一致";
+    if (r.parts_removed) extra += L"\n清理了上次留下的半成品 " + num(r.parts_removed) + L" 个";
+    if (!g.plan.conflicts.empty()) extra += L"\n目标里不一样、没有动的 " + num(int64_t(g.plan.conflicts.size())) + L" 个（见详情）";
+    const std::wstring body = std::wstring(b) + extra;
     std::wstring more;
+    for (size_t i = 0; i < g.plan.conflicts.size() && i < 30; i++) more += L"没动（目标里不一样）：" + W(g.plan.conflicts[i].dst) + L"\n";
     for (size_t i = 0; i < r.failed.size() && i < 30; i++) more += W(r.failed[i].first) + L"：" + W(r.failed[i].second) + L"\n";
     if (r.failed.size() > 30) more += L"……共 " + num(int64_t(r.failed.size())) + L" 个\n";
     if (!r.manifest.empty()) more += L"\n拷贝记录：" + W(r.manifest);
@@ -504,7 +663,7 @@ void on_copied() {
     c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | (more.empty() ? 0 : TDF_EXPAND_FOOTER_AREA);
     c.pszWindowTitle = L"kairocopy";
     c.pszMainInstruction = head.c_str();
-    c.pszContent = b;
+    c.pszContent = body.c_str();
     c.pszExpandedInformation = more.empty() ? nullptr : more.c_str();
     c.pszCollapsedControlText = L"详情";
     c.pszExpandedControlText = L"详情";
@@ -519,7 +678,10 @@ void on_copied() {
 void on_timer() {
     std::lock_guard<std::mutex> l(g.mu);
     if (g.busy == App::Busy::Analyzing) {
-        SetWindowTextW(g.total_text, (L"分析中：" + num(g.aprog.files) + L" 个文件，" + size_text(uint64_t(g.aprog.bytes)) + L"   " + W(g.aprog.dir)).c_str());
+        if (g.aprog.checking)
+            SetWindowTextW(g.total_text, (L"核对目标里已有的文件：" + num(g.aprog.check_done) + L" / " + num(g.aprog.check_total)).c_str());
+        else
+            SetWindowTextW(g.total_text, (L"分析中：" + num(g.aprog.files) + L" 个文件，" + size_text(uint64_t(g.aprog.bytes)) + L"   " + W(g.aprog.dir)).c_str());
         SendMessageW(g.total_bar, PBM_SETMARQUEE, TRUE, 30);
         return;
     }
@@ -642,6 +804,7 @@ void on_create(HWND h) {
     load(1, win::is_dir(U(r)) ? r : right);
     activate(0);
     SetFocus(g.pane[0].list);
+    PostMessageW(h, WM_APP_START, 0, 0);
     if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_ITaskbarList3, reinterpret_cast<void**>(&g.taskbar))))
         g.taskbar->HrInit();
 }
@@ -732,6 +895,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_APP_COPIED: on_copied(); return 0;
+    case WM_APP_START: offer_unfinished(); return 0;
     case WM_TIMER: if (w == TIMER_PROGRESS) on_timer(); return 0;
     case WM_CLOSE:
         if (g.busy == App::Busy::Copying &&
