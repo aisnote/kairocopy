@@ -91,4 +91,4 @@ cmake -S . -B build-release -G Ninja -DKAIROCOPY_STATIC=ON && cmake --build buil
 bash tools/package.sh v0.1.0
 ```
 
-第三方：SQLite（公有领域）、xxHash（BSD-2）。
+许可证：MIT（见 LICENSE）。第三方：SQLite（公有领域）、xxHash（BSD-2）。

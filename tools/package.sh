@@ -13,13 +13,7 @@ for e in kairocopy kairocopy-cli; do cp "$BUILD/$e.exe" "$OUT/"; strip "$OUT/$e.
 cp "$LIC/xxhash/LICENSE" "$OUT/licenses/xxHash-BSD-2-Clause.txt" 2>/dev/null || cp "$LIC/xxhash/COPYING" "$OUT/licenses/xxHash.txt"
 cp "$LIC/winpthreads/COPYING" "$OUT/licenses/winpthreads.txt"
 cp "$LIC/gcc-libs/COPYING.RUNTIME" "$OUT/licenses/GCC-runtime-library-exception.txt"
-cat > "$OUT/LICENSE.txt" <<EOT
-kairocopy $V for Windows (64-bit) - binary distribution
-Copyright (c) 2026 the kairocopy authors. All rights reserved.
-
-You may use this program. Its source code is at https://github.com/aisnote/kairocopy. It comes with no warranty of any kind.
-The third-party components inside it are listed in THIRD_PARTY_NOTICES.txt.
-EOT
+cp "$ROOT/LICENSE" "$OUT/LICENSE.txt"
 cat > "$OUT/THIRD_PARTY_NOTICES.txt" <<EOT
 Linked into kairocopy.exe and kairocopy-cli.exe:
   SQLite (public domain), xxHash (BSD-2-Clause), the GCC runtime (GPL-3.0 with the GCC Runtime Library Exception),
